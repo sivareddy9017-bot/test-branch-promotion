@@ -1,5 +1,5 @@
 
-name: Branch Promotion for test workflow123
+name: Branch Promotion for Test Workflow
 
 on:
   pull_request:
@@ -12,14 +12,16 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
 
 jobs:
   promote:
+    name: Create Promotion PR
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.merged == true
+
     runs-on: ubuntu-latest
 
     steps:
@@ -31,45 +33,104 @@ jobs:
       - name: Determine promotion
         id: promotion
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_TARGET: ${{ github.event.pull_request.base.ref }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "source=main" >> "$GITHUB_OUTPUT"
-            echo "target=dev" >> "$GITHUB_OUTPUT"
-          else
-            case "${{ github.event.pull_request.base.ref }}" in
-              main)
-                echo "source=main" >> "$GITHUB_OUTPUT"
-                echo "target=dev" >> "$GITHUB_OUTPUT"
-                ;;
-              dev)
-                echo "source=dev" >> "$GITHUB_OUTPUT"
-                echo "target=int62" >> "$GITHUB_OUTPUT"
-                ;;
-              int62)
-                echo "source=int62" >> "$GITHUB_OUTPUT"
-                echo "target=prod" >> "$GITHUB_OUTPUT"
-                ;;
-            esac
-          fi
+          case "$EVENT_NAME:$PR_TARGET" in
+            workflow_dispatch:*)
+              SOURCE="main"
+              TARGET="dev"
+              ;;
+            pull_request:main)
+              SOURCE="main"
+              TARGET="dev"
+              ;;
+            pull_request:dev)
+              SOURCE="dev"
+              TARGET="int62"
+              ;;
+            pull_request:int62)
+              SOURCE="int62"
+              TARGET="prod"
+              ;;
+            *)
+              echo "No promotion mapping found."
+              exit 1
+              ;;
+          esac
+
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+
+          echo "Promotion: $SOURCE -> $TARGET"
 
       - name: Create promotion PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           SOURCE: ${{ steps.promotion.outputs.source }}
           TARGET: ${{ steps.promotion.outputs.target }}
+        shell: bash
         run: |
-          if gh pr list \
+          set -euo pipefail
+
+          echo "Source branch: $SOURCE"
+          echo "Target branch: $TARGET"
+
+          # Refresh remote branch information
+          git fetch origin
+
+          # Verify source branch exists
+          if ! git ls-remote --exit-code --heads origin "$SOURCE" >/dev/null; then
+            echo "ERROR: Source branch '$SOURCE' does not exist."
+            exit 1
+          fi
+
+          # Verify target branch exists
+          if ! git ls-remote --exit-code --heads origin "$TARGET" >/dev/null; then
+            echo "ERROR: Target branch '$TARGET' does not exist."
+            exit 1
+          fi
+
+          # Verify branches have a common ancestor
+          if ! git merge-base \
+            "origin/$TARGET" "origin/$SOURCE" >/dev/null; then
+            echo "ERROR: Branches have no common ancestor."
+            exit 1
+          fi
+
+          # Check whether there are commits to promote
+          COUNT=$(git rev-list --count \
+            "origin/$TARGET..origin/$SOURCE")
+
+          echo "Commits to promote: $COUNT"
+
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "No new commits to promote. Skipping PR creation."
+            exit 0
+          fi
+
+          # Check for an existing open promotion PR
+          EXISTING=$(gh pr list \
+            --repo "$GH_REPO" \
             --base "$TARGET" \
             --head "$SOURCE" \
             --state open \
             --json number \
-            --jq 'length' | grep -qv '^0$'; then
+            --jq 'length')
+
+          if [[ "$EXISTING" -gt 0 ]]; then
             echo "Promotion PR already exists."
             exit 0
           fi
 
+          # Create the promotion PR
           gh pr create \
+            --repo "$GH_REPO" \
             --base "$TARGET" \
             --head "$SOURCE" \
             --title "Promote $SOURCE to $TARGET" \
             --body "Automated promotion PR from $SOURCE to $TARGET."
+
+          echo "Promotion PR created successfully."
