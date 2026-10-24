@@ -15,7 +15,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Print Hello World
-        run: echo "Hello World! GitHub Actions is working."
+      - name: Print Hello World!S
+        run: echo "Hello World! GitHub Actions is working fine now"
 
       
