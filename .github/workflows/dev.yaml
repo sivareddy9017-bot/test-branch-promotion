@@ -1,21 +1,75 @@
 
-name: Hello World
+name: Branch Promotion
 
 on:
-  push:
+  pull_request:
+    types: [closed]
     branches:
       - main
+      - dev
+      - int62
+
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  hello-world:
+  promote:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Print Hello World!S
-        run: echo "Hello World! GitHub Actions is working fine now"
+      - name: Determine promotion
+        id: promotion
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "source=main" >> "$GITHUB_OUTPUT"
+            echo "target=dev" >> "$GITHUB_OUTPUT"
+          else
+            case "${{ github.event.pull_request.base.ref }}" in
+              main)
+                echo "source=main" >> "$GITHUB_OUTPUT"
+                echo "target=dev" >> "$GITHUB_OUTPUT"
+                ;;
+              dev)
+                echo "source=dev" >> "$GITHUB_OUTPUT"
+                echo "target=int62" >> "$GITHUB_OUTPUT"
+                ;;
+              int62)
+                echo "source=int62" >> "$GITHUB_OUTPUT"
+                echo "target=prod" >> "$GITHUB_OUTPUT"
+                ;;
+            esac
+          fi
 
-      
+      - name: Create promotion PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE: ${{ steps.promotion.outputs.source }}
+          TARGET: ${{ steps.promotion.outputs.target }}
+        run: |
+          if gh pr list \
+            --base "$TARGET" \
+            --head "$SOURCE" \
+            --state open \
+            --json number \
+            --jq 'length' | grep -qv '^0$'; then
+            echo "Promotion PR already exists."
+            exit 0
+          fi
+
+          gh pr create \
+            --base "$TARGET" \
+            --head "$SOURCE" \
+            --title "Promote $SOURCE to $TARGET" \
+            --body "Automated promotion PR from $SOURCE to $TARGET."
