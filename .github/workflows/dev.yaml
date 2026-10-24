@@ -1,5 +1,5 @@
 
-name: Branch Promotion
+name: Branch Promotion for test workflow
 
 on:
   pull_request:
