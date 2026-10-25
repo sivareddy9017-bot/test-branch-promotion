@@ -1,7 +1,7 @@
 
 
 
-name: Automatic Branch Promotionss
+name: Automatic Branch Promotions and merge
 
 on:
   pull_request:
