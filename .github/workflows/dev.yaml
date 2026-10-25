@@ -1,7 +1,7 @@
 
 
 
-name: Automatic Branch Promotion
+name: Automatic Branch Promotionss
 
 on:
   pull_request:
