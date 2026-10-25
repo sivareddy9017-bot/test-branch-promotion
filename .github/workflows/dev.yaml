@@ -137,68 +137,10 @@ jobs:
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
 
-          printf '%s\n' "$SSH_PRIVATE_KEY" \
-            > "$HOME/.ssh/ec2_key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/ec2_key"
           chmod 600 "$HOME/.ssh/ec2_key"
 
-          # Retrieve the candidate SSH host key.
-          # For production, independently verify its fingerprint
-          # before trusting it.
-          ssh-keyscan -H "$SERVER_HOST" \
-            > "$HOME/.ssh/known_hosts" 2>/dev/null
+          echo "Checking SSH connectivity to EC2..."
 
-          if [[ ! -s "$HOME/.ssh/known_hosts" ]]; then
-            echo "ERROR: Could not retrieve the EC2 host key."
-            exit 1
-          fi
-
-          chmod 600 "$HOME/.ssh/known_hosts"
-
-          echo "Connecting to EC2 instance..."
-
-          ssh \
-            -i "$HOME/.ssh/ec2_key" \
-            -o IdentitiesOnly=yes \
-            -o BatchMode=yes \
-            -o StrictHostKeyChecking=yes \
-            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
-          set -euo pipefail
-
-          if [ ! -f /etc/os-release ]; then
-            echo "ERROR: Cannot identify Linux distribution."
-            exit 1
-          fi
-
-          . /etc/os-release
-
-          case "$ID" in
-            ubuntu|debian) ;;
-            *)
-              echo "ERROR: This step requires Ubuntu/Debian. Found: $ID"
-              exit 1
-              ;;
-          esac
-
-          echo "Updating package lists..."
-          sudo apt-get update
-
-          echo "Installing Nginx..."
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
-
-          echo "Validating Nginx configuration..."
-          sudo nginx -t
-
-          echo "Enabling and starting Nginx..."
-          sudo systemctl enable --now nginx
-
-          sudo systemctl is-active --quiet nginx
-
-          echo "SUCCESS: Nginx is installed and running."
-          REMOTE
-
-      # Step 5: Workflow summary
-      - name: Workflow summary
-        shell: bash
-        run: |
-          echo "Branch promotion and Nginx installation completed."
+          if ! ssh-keyscan -T 10 -H "$SERVER_HOST
 
