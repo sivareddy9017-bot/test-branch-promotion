@@ -137,10 +137,45 @@ jobs:
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
 
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/ec2_key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" \
+            > "$HOME/.ssh/ec2_key"
           chmod 600 "$HOME/.ssh/ec2_key"
 
           echo "Checking SSH connectivity to EC2..."
 
-          if ! ssh-keyscan -T 10 -H "$SERVER_HOST
+          if ! ssh-keyscan -T 10 -H "$SERVER_HOST" \
+              > "$HOME/.ssh/known_hosts" 2>/dev/null; then
+            echo "ERROR: Unable to retrieve the SSH host key."
+            echo "Check SERVER_HOST, network access, and port 22."
+            exit 1
+          fi
+
+          if [[ ! -s "$HOME/.ssh/known_hosts" ]]; then
+            echo "ERROR: No SSH host key was retrieved."
+            exit 1
+          fi
+
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          echo "Connecting to EC2 as $SERVER_USER..."
+
+          ssh \
+            -i "$HOME/.ssh/ec2_key" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            "$SERVER_USER@$SERVER_HOST" \
+            "sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx && sudo nginx -t && sudo systemctl enable --now nginx && sudo systemctl is-active nginx"
+
+          echo "SUCCESS: Nginx is installed and running."
+
+      # Step 5: Workflow summary
+      - name: Workflow summary
+        shell: bash
+        run: |
+          echo "Branch promotions completed."
+          echo "Nginx installation and service verification completed."
+
+
 
