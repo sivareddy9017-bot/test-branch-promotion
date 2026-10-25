@@ -18,22 +18,25 @@ concurrency:
 
 jobs:
   promote:
-    name: Promote main to dev to int62
+    name: Promote branches and configure Nginx
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.merged == true
-
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Checkout repository
+      # --------------------------------------------------
+      # 1. Checkout repository
+      # --------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      # Step 2: Verify GitHub authentication
+      # --------------------------------------------------
+      # 2. Verify GitHub CLI authentication
+      # --------------------------------------------------
       - name: Verify GitHub CLI authentication
         env:
           GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
@@ -47,7 +50,9 @@ jobs:
           gh auth status
           gh repo view "$GH_REPO" --json name
 
-      # Step 3: Promote main -> dev -> int62
+      # --------------------------------------------------
+      # 3. Promote main -> dev -> int62
+      # --------------------------------------------------
       - name: Promote branches
         env:
           GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
@@ -109,10 +114,6 @@ jobs:
               --merge
 
             echo "Successfully promoted $SOURCE -> $TARGET"
-
-            git fetch origin \
-              "+refs/heads/$SOURCE:refs/remotes/origin/$SOURCE" \
-              "+refs/heads/$TARGET:refs/remotes/origin/$TARGET"
           }
 
           promote main dev
@@ -120,8 +121,10 @@ jobs:
 
           echo "All branch promotions completed."
 
-      # Step 4: Install and start Nginx on EC2
-      - name: Install and start Nginx
+      # --------------------------------------------------
+      # 4. Validate SSH secrets and private key
+      # --------------------------------------------------
+      - name: Validate SSH configuration
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
@@ -137,16 +140,56 @@ jobs:
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
 
-          printf '%s\n' "$SSH_PRIVATE_KEY" \
-            > "$HOME/.ssh/ec2_key"
+          printf '%s\n' "$SSH_PRIVATE_KEY" |
+            tr -d '\r' > "$HOME/.ssh/ec2_key"
+
           chmod 600 "$HOME/.ssh/ec2_key"
+
+          echo "Checking private key format..."
+
+          if ! ssh-keygen -y \
+              -f "$HOME/.ssh/ec2_key" \
+              > "$HOME/.ssh/derived.pub"; then
+            echo "ERROR: Private key is invalid or requires a passphrase."
+            exit 1
+          fi
+
+          echo "Private key is valid."
+          echo "Derived public-key fingerprint:"
+
+          ssh-keygen -lf "$HOME/.ssh/derived.pub"
+
+          echo "SSH username: $SERVER_USER"
+          echo "SSH configuration validation completed."
+
+      # --------------------------------------------------
+      # 5. Check SSH connectivity and retrieve host key
+      # --------------------------------------------------
+      - name: Check EC2 SSH connectivity
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
           echo "Checking SSH connectivity to EC2..."
 
-          if ! ssh-keyscan -T 10 -H "$SERVER_HOST" \
-              > "$HOME/.ssh/known_hosts" 2>/dev/null; then
-            echo "ERROR: Unable to retrieve the SSH host key."
-            echo "Check SERVER_HOST, network access, and port 22."
+          if ! timeout 10 bash -c \
+              'exec 3<>/dev/tcp/$1/22' _ "$SERVER_HOST" \
+              2>/dev/null; then
+            echo "ERROR: Cannot reach SSH port 22."
+            echo "Check the host address, instance status, and security group."
+            exit 1
+          fi
+
+          echo "SSH port 22 is reachable."
+
+          if ! ssh-keyscan -T 10 -p 22 \
+              -t ed25519,rsa "$SERVER_HOST" \
+              > "$HOME/.ssh/known_hosts" \
+              2> "$HOME/.ssh/keyscan.log"; then
+            cat "$HOME/.ssh/keyscan.log"
+            echo "ERROR: Failed to retrieve SSH host key."
             exit 1
           fi
 
@@ -157,7 +200,58 @@ jobs:
 
           chmod 600 "$HOME/.ssh/known_hosts"
 
-          echo "Connecting to EC2 as $SERVER_USER..."
+          echo "SSH host key retrieved."
+
+      # --------------------------------------------------
+      # 6. Diagnose and test SSH authentication
+      # --------------------------------------------------
+      - name: Diagnose EC2 SSH authentication
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Testing SSH authentication as $SERVER_USER..."
+
+          set +e
+          ssh -vvv \
+            -i "$HOME/.ssh/ec2_key" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            "$SERVER_USER@$SERVER_HOST" \
+            "whoami" \
+            > "$HOME/.ssh/ssh-debug.log" 2>&1
+          SSH_STATUS=$?
+          set -e
+
+          grep -E \
+            'Offering public key|Server accepts key|Authentications that can continue|Load key|identity file|sign_and_send_pubkey|Authenticated to|Permission denied|No more authentication methods' \
+            "$HOME/.ssh/ssh-debug.log" || true
+
+          if [[ "$SSH_STATUS" -ne 0 ]]; then
+            echo "ERROR: SSH authentication failed."
+            echo "Exit code: $SSH_STATUS"
+            exit "$SSH_STATUS"
+          fi
+
+          echo "SSH authentication successful."
+
+      # --------------------------------------------------
+      # 7. Install and start Nginx
+      # --------------------------------------------------
+      - name: Install and start Nginx
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Installing Nginx on EC2..."
 
           ssh \
             -i "$HOME/.ssh/ec2_key" \
@@ -166,16 +260,25 @@ jobs:
             -o ConnectTimeout=15 \
             -o StrictHostKeyChecking=yes \
             "$SERVER_USER@$SERVER_HOST" \
-            "sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx && sudo nginx -t && sudo systemctl enable --now nginx && sudo systemctl is-active nginx"
+            "sudo apt-get update &&
+             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx &&
+             sudo nginx -t &&
+             sudo systemctl enable --now nginx &&
+             sudo systemctl is-active nginx"
 
           echo "SUCCESS: Nginx is installed and running."
 
-      # Step 5: Workflow summary
+      # --------------------------------------------------
+      # 8. Workflow summary
+      # --------------------------------------------------
       - name: Workflow summary
+        if: success()
         shell: bash
         run: |
           echo "Branch promotions completed."
-          echo "Nginx installation and service verification completed."
+          echo "SSH authentication succeeded."
+          echo "Nginx installation and verification completed."
+
 
 
 
