@@ -1,14 +1,11 @@
 
-
-
-name: Automatic Branch Promotions and merge
+name: Automatic Branch Promotions and Nginx Installation
 
 on:
   pull_request:
     types: [closed]
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
@@ -29,12 +26,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Step 1: Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      # Step 2: Verify GitHub authentication
       - name: Verify GitHub CLI authentication
         env:
           GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
@@ -43,15 +42,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "ERROR: PROMOTION_TOKEN is missing or unavailable."
-            exit 1
-          fi
+          : "${GH_TOKEN:?PROMOTION_TOKEN secret is missing}"
 
           gh auth status
           gh repo view "$GH_REPO" --json name
 
-      - name: Promote main to dev and dev to int62
+      # Step 3: Promote main -> dev -> int62
+      - name: Promote branches
         env:
           GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -69,27 +66,23 @@ jobs:
             echo "Promotion: $SOURCE -> $TARGET"
             echo "======================================"
 
-            # Fetch the latest source and target branches.
             git fetch origin \
               "+refs/heads/$SOURCE:refs/remotes/origin/$SOURCE" \
               "+refs/heads/$TARGET:refs/remotes/origin/$TARGET"
 
-            # Ensure the branches have a common ancestor.
             git merge-base \
               "origin/$TARGET" "origin/$SOURCE" >/dev/null
 
-            # Count commits present in source but not target.
             COUNT=$(git rev-list --count \
               "origin/$TARGET..origin/$SOURCE")
 
             echo "Commits to promote: $COUNT"
 
             if [[ "$COUNT" -eq 0 ]]; then
-              echo "No changes to promote. Skipping."
+              echo "No changes to promote."
               return 0
             fi
 
-            # Find an existing open promotion PR.
             PR_URL=$(gh pr list \
               --repo "$GH_REPO" \
               --base "$TARGET" \
@@ -98,7 +91,6 @@ jobs:
               --json url \
               --jq '.[0].url // empty')
 
-            # Create the PR if one does not exist.
             if [[ -z "$PR_URL" ]]; then
               PR_URL=$(gh pr create \
                 --repo "$GH_REPO" \
@@ -107,29 +99,106 @@ jobs:
                 --title "Promote $SOURCE to $TARGET" \
                 --body "Automated promotion PR from $SOURCE to $TARGET.")
 
-              echo "Created promotion PR: $PR_URL"
+              echo "Created PR: $PR_URL"
             else
-              echo "Using existing promotion PR: $PR_URL"
+              echo "Using existing PR: $PR_URL"
             fi
 
-            # Merge immediately; repository rules still apply.
             gh pr merge "$PR_URL" \
               --repo "$GH_REPO" \
               --merge
 
-            echo "Successfully merged $SOURCE -> $TARGET"
+            echo "Successfully promoted $SOURCE -> $TARGET"
 
-            # Refresh branches after the merge.
             git fetch origin \
               "+refs/heads/$SOURCE:refs/remotes/origin/$SOURCE" \
               "+refs/heads/$TARGET:refs/remotes/origin/$TARGET"
           }
 
-          # Stage 1: main -> dev
           promote main dev
-
-          # Stage 2: dev -> int62
-          # Runs only if Stage 1 succeeds or has nothing to promote.
           promote dev int62
 
-          echo "All promotion stages completed."
+          echo "All branch promotions completed."
+
+      # Step 4: Install and start Nginx on EC2
+      - name: Install and start Nginx
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : "${SERVER_HOST:?SERVER_HOST secret is missing}"
+          : "${SERVER_USER:?SERVER_USER secret is missing}"
+          : "${SSH_PRIVATE_KEY:?SERVER_SSH_KEY secret is missing}"
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" \
+            > "$HOME/.ssh/ec2_key"
+          chmod 600 "$HOME/.ssh/ec2_key"
+
+          # Retrieve the candidate SSH host key.
+          # For production, independently verify its fingerprint
+          # before trusting it.
+          ssh-keyscan -H "$SERVER_HOST" \
+            > "$HOME/.ssh/known_hosts" 2>/dev/null
+
+          if [[ ! -s "$HOME/.ssh/known_hosts" ]]; then
+            echo "ERROR: Could not retrieve the EC2 host key."
+            exit 1
+          fi
+
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          echo "Connecting to EC2 instance..."
+
+          ssh \
+            -i "$HOME/.ssh/ec2_key" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$SERVER_USER@$SERVER_HOST" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+
+          if [ ! -f /etc/os-release ]; then
+            echo "ERROR: Cannot identify Linux distribution."
+            exit 1
+          fi
+
+          . /etc/os-release
+
+          case "$ID" in
+            ubuntu|debian) ;;
+            *)
+              echo "ERROR: This step requires Ubuntu/Debian. Found: $ID"
+              exit 1
+              ;;
+          esac
+
+          echo "Updating package lists..."
+          sudo apt-get update
+
+          echo "Installing Nginx..."
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx
+
+          echo "Validating Nginx configuration..."
+          sudo nginx -t
+
+          echo "Enabling and starting Nginx..."
+          sudo systemctl enable --now nginx
+
+          sudo systemctl is-active --quiet nginx
+
+          echo "SUCCESS: Nginx is installed and running."
+          REMOTE
+
+      # Step 5: Workflow summary
+      - name: Workflow summary
+        shell: bash
+        run: |
+          echo "Branch promotion and Nginx installation completed."
+
