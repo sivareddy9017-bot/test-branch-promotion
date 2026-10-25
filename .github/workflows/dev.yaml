@@ -1,5 +1,6 @@
 
 
+
 name: Automatic Branch Promotion
 
 on:
@@ -11,8 +12,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 concurrency:
   group: automatic-branch-promotion
@@ -34,17 +35,27 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up GitHub CLI
-        env:
-          GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
-        run: |
-          gh auth status
-
-      - name: Promote main to dev and dev to int62
-        shell: bash
+      - name: Verify GitHub CLI authentication
         env:
           GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
           GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "ERROR: PROMOTION_TOKEN is missing or unavailable."
+            exit 1
+          fi
+
+          gh auth status
+          gh repo view "$GH_REPO" --json name
+
+      - name: Promote main to dev and dev to int62
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -58,27 +69,27 @@ jobs:
             echo "Promotion: $SOURCE -> $TARGET"
             echo "======================================"
 
-            # Update remote branch information
+            # Fetch the latest source and target branches.
             git fetch origin \
               "+refs/heads/$SOURCE:refs/remotes/origin/$SOURCE" \
               "+refs/heads/$TARGET:refs/remotes/origin/$TARGET"
 
-            # Verify that branches have a common ancestor
+            # Ensure the branches have a common ancestor.
             git merge-base \
               "origin/$TARGET" "origin/$SOURCE" >/dev/null
 
-            # Check whether commits need promoting
+            # Count commits present in source but not target.
             COUNT=$(git rev-list --count \
               "origin/$TARGET..origin/$SOURCE")
 
             echo "Commits to promote: $COUNT"
 
             if [[ "$COUNT" -eq 0 ]]; then
-              echo "No changes to promote from $SOURCE to $TARGET."
+              echo "No changes to promote. Skipping."
               return 0
             fi
 
-            # Find an existing open promotion PR
+            # Find an existing open promotion PR.
             PR_URL=$(gh pr list \
               --repo "$GH_REPO" \
               --base "$TARGET" \
@@ -87,28 +98,28 @@ jobs:
               --json url \
               --jq '.[0].url // empty')
 
-            # Create a PR if one does not exist
+            # Create the PR if one does not exist.
             if [[ -z "$PR_URL" ]]; then
               PR_URL=$(gh pr create \
                 --repo "$GH_REPO" \
                 --base "$TARGET" \
                 --head "$SOURCE" \
                 --title "Promote $SOURCE to $TARGET" \
-                --body "Automated promotion: $SOURCE to $TARGET.")
+                --body "Automated promotion PR from $SOURCE to $TARGET.")
 
               echo "Created promotion PR: $PR_URL"
             else
-              echo "Existing promotion PR: $PR_URL"
+              echo "Using existing promotion PR: $PR_URL"
             fi
 
-            # Merge immediately; do not use GitHub auto-merge
+            # Merge immediately; repository rules still apply.
             gh pr merge "$PR_URL" \
               --repo "$GH_REPO" \
               --merge
 
-            echo "Successfully merged: $SOURCE -> $TARGET"
+            echo "Successfully merged $SOURCE -> $TARGET"
 
-            # Refresh branch information after the merge
+            # Refresh branches after the merge.
             git fetch origin \
               "+refs/heads/$SOURCE:refs/remotes/origin/$SOURCE" \
               "+refs/heads/$TARGET:refs/remotes/origin/$TARGET"
