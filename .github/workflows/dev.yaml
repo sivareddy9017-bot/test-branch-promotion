@@ -12,12 +12,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
   promote:
-    name: Create Promotion PR
+    name: Create and Auto-Merge Promotion PR
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.merged == true
@@ -65,7 +65,7 @@ jobs:
 
           echo "Promotion: $SOURCE -> $TARGET"
 
-      - name: Create promotion PR
+      - name: Create and auto-merge promotion PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -75,62 +75,56 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Source branch: $SOURCE"
-          echo "Target branch: $TARGET"
+          echo "Promotion: $SOURCE -> $TARGET"
 
-          # Refresh remote branch information
           git fetch origin
 
-          # Verify source branch exists
-          if ! git ls-remote --exit-code --heads origin "$SOURCE" >/dev/null; then
-            echo "ERROR: Source branch '$SOURCE' does not exist."
-            exit 1
-          fi
+          # Verify source and target branches exist
+          git ls-remote --exit-code --heads origin "$SOURCE" >/dev/null
+          git ls-remote --exit-code --heads origin "$TARGET" >/dev/null
 
-          # Verify target branch exists
-          if ! git ls-remote --exit-code --heads origin "$TARGET" >/dev/null; then
-            echo "ERROR: Target branch '$TARGET' does not exist."
-            exit 1
-          fi
+          # Verify common ancestor
+          git merge-base \
+            "origin/$TARGET" "origin/$SOURCE" >/dev/null
 
-          # Verify branches have a common ancestor
-          if ! git merge-base \
-            "origin/$TARGET" "origin/$SOURCE" >/dev/null; then
-            echo "ERROR: Branches have no common ancestor."
-            exit 1
-          fi
-
-          # Check whether there are commits to promote
+          # Check for commits to promote
           COUNT=$(git rev-list --count \
             "origin/$TARGET..origin/$SOURCE")
 
           echo "Commits to promote: $COUNT"
 
           if [[ "$COUNT" -eq 0 ]]; then
-            echo "No new commits to promote. Skipping PR creation."
+            echo "No new commits to promote."
             exit 0
           fi
 
-          # Check for an existing open promotion PR
-          EXISTING=$(gh pr list \
+          # Find an existing promotion PR, if present
+          PR_URL=$(gh pr list \
             --repo "$GH_REPO" \
             --base "$TARGET" \
             --head "$SOURCE" \
             --state open \
-            --json number \
-            --jq 'length')
+            --json url \
+            --jq '.[0].url // empty')
 
-          if [[ "$EXISTING" -gt 0 ]]; then
-            echo "Promotion PR already exists."
-            exit 0
+          # Create a PR only if one does not already exist
+          if [[ -z "$PR_URL" ]]; then
+            PR_URL=$(gh pr create \
+              --repo "$GH_REPO" \
+              --base "$TARGET" \
+              --head "$SOURCE" \
+              --title "Promote $SOURCE to $TARGET" \
+              --body "Automated promotion PR from $SOURCE to $TARGET.")
+
+            echo "Created promotion PR: $PR_URL"
+          else
+            echo "Using existing promotion PR: $PR_URL"
           fi
 
-          # Create the promotion PR
-          gh pr create \
+          # Enable automatic merging
+          gh pr merge "$PR_URL" \
             --repo "$GH_REPO" \
-            --base "$TARGET" \
-            --head "$SOURCE" \
-            --title "Promote $SOURCE to $TARGET" \
-            --body "Automated promotion PR from $SOURCE to $TARGET."
+            --merge \
+            --auto
 
-          echo "Promotion PR created successfully."
+          echo "Auto-merge enabled for: $PR_URL"
