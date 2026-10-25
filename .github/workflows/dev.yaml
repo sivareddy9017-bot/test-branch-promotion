@@ -1,23 +1,27 @@
 
-name: Branch Promotion for Test Workflow
+
+
+name: Automatic Branch Promotionss
 
 on:
   pull_request:
     types: [closed]
     branches:
       - main
-      - dev
-      - int62
 
   workflow_dispatch:
 
 permissions:
   contents: read
-  pull-requests: write
+  pull-requests: read
+
+concurrency:
+  group: automatic-branch-promotion
+  cancel-in-progress: false
 
 jobs:
   promote:
-    name: Create Promotion PR
+    name: Promote main to dev to int62
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.merged == true
@@ -29,108 +33,103 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Determine promotion
-        id: promotion
-        shell: bash
+      - name: Verify GitHub CLI authentication
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_TARGET: ${{ github.event.pull_request.base.ref }}
-        run: |
-          case "$EVENT_NAME:$PR_TARGET" in
-            workflow_dispatch:*)
-              SOURCE="main"
-              TARGET="dev"
-              ;;
-            pull_request:main)
-              SOURCE="main"
-              TARGET="dev"
-              ;;
-            pull_request:dev)
-              SOURCE="dev"
-              TARGET="int62"
-              ;;
-            pull_request:int62)
-              SOURCE="int62"
-              TARGET="prod"
-              ;;
-            *)
-              echo "No promotion mapping found."
-              exit 1
-              ;;
-          esac
-
-          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
-          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-
-          echo "Promotion: $SOURCE -> $TARGET"
-
-      - name: Create promotion PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          SOURCE: ${{ steps.promotion.outputs.source }}
-          TARGET: ${{ steps.promotion.outputs.target }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Source branch: $SOURCE"
-          echo "Target branch: $TARGET"
-
-          # Refresh remote branch information
-          git fetch origin
-
-          # Verify source branch exists
-          if ! git ls-remote --exit-code --heads origin "$SOURCE" >/dev/null; then
-            echo "ERROR: Source branch '$SOURCE' does not exist."
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "ERROR: PROMOTION_TOKEN is missing or unavailable."
             exit 1
           fi
 
-          # Verify target branch exists
-          if ! git ls-remote --exit-code --heads origin "$TARGET" >/dev/null; then
-            echo "ERROR: Target branch '$TARGET' does not exist."
-            exit 1
-          fi
+          gh auth status
+          gh repo view "$GH_REPO" --json name
 
-          # Verify branches have a common ancestor
-          if ! git merge-base \
-            "origin/$TARGET" "origin/$SOURCE" >/dev/null; then
-            echo "ERROR: Branches have no common ancestor."
-            exit 1
-          fi
+      - name: Promote main to dev and dev to int62
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTION_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          # Check whether there are commits to promote
-          COUNT=$(git rev-list --count \
-            "origin/$TARGET..origin/$SOURCE")
+          promote() {
+            local SOURCE="$1"
+            local TARGET="$2"
+            local COUNT
+            local PR_URL
 
-          echo "Commits to promote: $COUNT"
+            echo "======================================"
+            echo "Promotion: $SOURCE -> $TARGET"
+            echo "======================================"
 
-          if [[ "$COUNT" -eq 0 ]]; then
-            echo "No new commits to promote. Skipping PR creation."
-            exit 0
-          fi
+            # Fetch the latest source and target branches.
+            git fetch origin \
+              "+refs/heads/$SOURCE:refs/remotes/origin/$SOURCE" \
+              "+refs/heads/$TARGET:refs/remotes/origin/$TARGET"
 
-          # Check for an existing open promotion PR
-          EXISTING=$(gh pr list \
-            --repo "$GH_REPO" \
-            --base "$TARGET" \
-            --head "$SOURCE" \
-            --state open \
-            --json number \
-            --jq 'length')
+            # Ensure the branches have a common ancestor.
+            git merge-base \
+              "origin/$TARGET" "origin/$SOURCE" >/dev/null
 
-          if [[ "$EXISTING" -gt 0 ]]; then
-            echo "Promotion PR already exists."
-            exit 0
-          fi
+            # Count commits present in source but not target.
+            COUNT=$(git rev-list --count \
+              "origin/$TARGET..origin/$SOURCE")
 
-          # Create the promotion PR
-          gh pr create \
-            --repo "$GH_REPO" \
-            --base "$TARGET" \
-            --head "$SOURCE" \
-            --title "Promote $SOURCE to $TARGET" \
-            --body "Automated promotion PR from $SOURCE to $TARGET."
+            echo "Commits to promote: $COUNT"
 
-          echo "Promotion PR created successfully."
+            if [[ "$COUNT" -eq 0 ]]; then
+              echo "No changes to promote. Skipping."
+              return 0
+            fi
+
+            # Find an existing open promotion PR.
+            PR_URL=$(gh pr list \
+              --repo "$GH_REPO" \
+              --base "$TARGET" \
+              --head "$SOURCE" \
+              --state open \
+              --json url \
+              --jq '.[0].url // empty')
+
+            # Create the PR if one does not exist.
+            if [[ -z "$PR_URL" ]]; then
+              PR_URL=$(gh pr create \
+                --repo "$GH_REPO" \
+                --base "$TARGET" \
+                --head "$SOURCE" \
+                --title "Promote $SOURCE to $TARGET" \
+                --body "Automated promotion PR from $SOURCE to $TARGET.")
+
+              echo "Created promotion PR: $PR_URL"
+            else
+              echo "Using existing promotion PR: $PR_URL"
+            fi
+
+            # Merge immediately; repository rules still apply.
+            gh pr merge "$PR_URL" \
+              --repo "$GH_REPO" \
+              --merge
+
+            echo "Successfully merged $SOURCE -> $TARGET"
+
+            # Refresh branches after the merge.
+            git fetch origin \
+              "+refs/heads/$SOURCE:refs/remotes/origin/$SOURCE" \
+              "+refs/heads/$TARGET:refs/remotes/origin/$TARGET"
+          }
+
+          # Stage 1: main -> dev
+          promote main dev
+
+          # Stage 2: dev -> int62
+          # Runs only if Stage 1 succeeds or has nothing to promote.
+          promote dev int62
+
+          echo "All promotion stages completed."
